@@ -1,13 +1,12 @@
 import sqlite3
 import threading
 import logging
-from telegram import Update
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackContext
 from dotenv import load_dotenv
 import os
 from omdb import OMDB
-from netnaija import movie_link  # Import the movie_link function from netnaija
+from netnaija import movie_link, movie_series_link
 
 load_dotenv()
 
@@ -15,6 +14,8 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 
 class MovieBot:
+    CHOOSING, TYPING_MOVIE, TYPING_SERIES = range(3)
+
     def __init__(self, token, api_key):
         self.token = token
         self.api_key = api_key
@@ -28,41 +29,59 @@ class MovieBot:
                             "(user_id INTEGER, search_query TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
         self.connection.commit()
 
-    def start(self, update: Update, context: CallbackContext) -> None:
-        reply_buttons = [['/start', '/help'], ['/history']]
-        reply_markup = ReplyKeyboardMarkup(reply_buttons, resize_keyboard=True)
-        update.message.reply_text(
-            "Hi! I am a movie bot. Send any movie name to get information about it.",
-            reply_markup=reply_markup
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', self.start)],
+            states={
+                self.CHOOSING: [MessageHandler(Filters.regex('^(Movie|Series)$'), self.choice)],
+                self.TYPING_MOVIE: [MessageHandler(Filters.text & ~Filters.command, self.search_movie)],
+                self.TYPING_SERIES: [MessageHandler(Filters.text & ~Filters.command, self.search_series)],
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel)],
         )
 
-    def help_command(self, update: Update, context: CallbackContext) -> None:
-        reply_buttons = [['/start', '/help'], ['/history']]
+        self.dispatcher.add_handler(conv_handler)
+        self.dispatcher.add_handler(CommandHandler("history", self.view_search_history))
+        self.dispatcher.add_handler(CommandHandler("help", self.help))
+        self.dispatcher.add_error_handler(self.error)
+
+    def start(self, update: Update, context: CallbackContext) -> int:
+        user_id = update.message.from_user.id
+        context.user_data['search_type'] = None
+        reply_buttons = [['Movie', 'Series'], ['/start', '/help'], ['/history']]
         reply_markup = ReplyKeyboardMarkup(reply_buttons, resize_keyboard=True)
         update.message.reply_text(
-            "This is a movie rating bot. Just enter the movie name to get brief info.",
+            "Please choose whether you want to search for a movie or a series:",
             reply_markup=reply_markup
         )
+        return self.CHOOSING
 
-    def search(self, update: Update, context: CallbackContext):
+    def choice(self, update: Update, context: CallbackContext) -> int:
+        user_choice = update.message.text.lower()
+        context.user_data['search_type'] = user_choice
+        if user_choice == 'movie':
+            update.message.reply_text("Great! Please enter the name of the movie.")
+            return self.TYPING_MOVIE
+        elif user_choice == 'series':
+            update.message.reply_text("Sure! Please enter the name of the series.")
+            return self.TYPING_SERIES
+
+    def search_movie(self, update: Update, context: CallbackContext) -> int:
+        user_id = update.message.from_user.id
+        movie_name = update.message.text
+
         reply_buttons = [['/start', '/help'], ['/history']]
         reply_markup = ReplyKeyboardMarkup(reply_buttons, resize_keyboard=True)
         update.message.reply_text(
-            "Please wait while I fetch the movie information...",
+            "Please wait while the movie information is fetch for you...",
             reply_markup=None
         )
 
-        user_id = update.message.from_user.id
-        movie_name = update.message.text
-        movie_link_result = movie_link(movie_name)  # Call the movie_link function
+        movie_link_result = movie_link(movie_name)
 
         message = ""
-        
+
         if movie_link_result:
             threading.Thread(target=self._store_search_history, args=(user_id, movie_name)).start()
-
-            # You can add the movie_link_result to the message here
-            # message = f"Download Link: {movie_link_result}\n\n"
 
             movie_info = self.omdb_client.movie_info(movie_name)
 
@@ -71,14 +90,13 @@ class MovieBot:
                 for rating in movie_info['ratings']:
                     rating_text += f"{rating['Source']}: {rating['Value']}\n"
 
-
-                message += (f"{movie_info['title']} ({movie_info['year']}): \n\n" +
-                            f"Plot:\n{movie_info['plot']}\n\n" +
-                            f"Starring:\n{movie_info['actors']}\n\n" +
-                            f"Ratings:\n{rating_text}" +
-                            f"Download Link: {movie_link_result}\n" +
-                            f"Poster:\n{movie_info['poster']}\n\n"
-                            )
+                message += (f"{movie_info['title']}: \n\n" +
+                           f"Plot:\n{movie_info['plot']}\n\n" +
+                           f"Starring:\n{movie_info['actors']}\n\n" +
+                           f"Ratings:\n{rating_text}" +
+                           f"Download Link: {movie_link_result}\n" +
+                           f"Poster:\n{movie_info['poster']}\n\n"
+                           )
             else:
                 message = f"Movie '{movie_name}' not found on the OMDb site. Please check your spelling errors and try again."
 
@@ -86,6 +104,41 @@ class MovieBot:
         else:
             message = f"Download link for movie '{movie_name}' not found on NetNaija. Please check your spelling errors and try again."
             update.message.reply_text(message)
+
+        return self.start(update, context)
+
+    def search_series(self, update: Update, context: CallbackContext) -> int:
+        user_id = update.message.from_user.id
+        series_name = update.message.text
+
+        reply_buttons = [['/start', '/help'], ['/history']]
+        reply_markup = ReplyKeyboardMarkup(reply_buttons, resize_keyboard=True)
+        update.message.reply_text(
+            "Please wait while the series information is fetch for you...",
+            reply_markup=None
+        )
+
+        series_links = movie_series_link(series_name)
+
+        if series_links:
+            threading.Thread(target=self._store_search_history, args=(user_id, series_name)).start()
+
+            for link in series_links:
+                message = f"Download Link for series '{series_name}':\n{link}"
+                update.message.reply_text(message)
+        else:
+            message = f"Download links for series '{series_name}' not found on NetNaija. Please check your spelling errors and try again."
+            update.message.reply_text(message)
+
+        return self.start(update, context)
+
+    def cancel(self, update: Update, context: CallbackContext) -> int:
+        update.message.reply_text("Search canceled. Please choose 'Movie' or 'Series' again.")
+        return self.start(update, context)
+    
+    def help(self, update: Update, context: CallbackContext) -> int:
+        update.message.reply_text("Search movie/series by choosing between movie and series button\n\n And then type the movie/series name.\n\nNB: Start the bot first.")
+        
 
     def _store_search_history(self, user_id, movie_name):
         self.cursor.execute("INSERT INTO search_history (user_id, search_query) VALUES (?, ?)",
@@ -111,13 +164,6 @@ class MovieBot:
         update.message.reply_text("An error occurred. Please try again later.")
 
     def run(self):
-        self.dispatcher.add_handler(CommandHandler("start", self.start))
-        self.dispatcher.add_handler(CommandHandler("help", self.help_command))
-        self.dispatcher.add_handler(CommandHandler("history", self.view_search_history))
-        infor_handler = MessageHandler(Filters.text, self.search)
-        self.dispatcher.add_handler(infor_handler)
-        self.dispatcher.add_error_handler(self.error)
-
         self.updater.start_polling()
         self.updater.idle()
 
